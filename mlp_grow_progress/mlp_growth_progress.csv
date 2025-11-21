@@ -1,0 +1,3 @@
+iteration,train_limit,base_hidden_sizes,final_hidden_sizes,val_error,master_val_error,growth_steps
+1,500,[8],"[8, 8]",7.176993053681982,8.100617584958623,1
+2,1000,"[8, 8]","[8, 8]",7.906215867564852,8.019738678026947,0

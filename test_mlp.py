@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import os
 from typing import Sequence, Tuple, Dict, Any
 
@@ -8,11 +9,12 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
+from torch.utils.data import DataLoader
 
 
 class MLP(nn.Module):
     """
-    Simple fully-connected MLP with ReLU activations.
+    Simple fully-connected MLP with configurable activations.
 
     Parameters
     ----------
@@ -22,21 +24,53 @@ class MLP(nn.Module):
         Sizes of hidden layers.
     output_dim : int
         Dimension of output vector.
+    activation : str
+        Non-linearity to use between hidden layers ('relu' or 'tanh').
     """
 
-    def __init__(self, input_dim: int, hidden_sizes: Sequence[int], output_dim: int):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_sizes: Sequence[int],
+        output_dim: int,
+        activation: str = "tanh",
+    ):
         super().__init__()
+        activation_lower = activation.lower()
+        if activation_lower not in {"relu", "tanh"}:
+            raise ValueError("activation must be either 'relu' or 'tanh'.")
+        self.activation_name = activation_lower
+
         layers = []
         prev_dim = input_dim
         for h in hidden_sizes:
             layers.append(nn.Linear(prev_dim, h))
-            layers.append(nn.ReLU())
+            if activation_lower == "relu":
+                layers.append(nn.ReLU())
+            else:
+                layers.append(nn.Tanh())
             prev_dim = h
         layers.append(nn.Linear(prev_dim, output_dim))
         self.net = nn.Sequential(*layers)
+        self._init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         return self.net(x)
+
+    def _init_weights(self) -> None:
+        """
+        Initialize all linear layers with Xavier uniform weights and zero bias.
+        """
+        for module in self.net:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def reinitialize(self) -> None:
+        """
+        Reinitialize network weights (Xavier uniform) to a fresh random state.
+        """
+        self._init_weights()
 
 
 # def log_posterior_unnorm_numpy(
@@ -78,6 +112,7 @@ def log_posterior_unnorm_numpy(
     y_obs: np.ndarray,
     sigma_prior: float = 1.0,
     sigma_lik: float = 1.0,
+    batch_growth: float | None = None,
 ) -> np.ndarray:
     """
     Independent standard-normal prior on 'par' (each dimension),
@@ -98,6 +133,29 @@ def log_posterior_unnorm_numpy(
     resid = obs - y_obs[None, :]
     lp_lik = -0.5 * np.sum((resid / sigma_lik) ** 2, axis=1)
     return lp_prior + lp_lik
+
+
+def _logpi_from_preds(
+    par_batch: torch.Tensor,
+    obs_pred: torch.Tensor,
+    y_obs_tensor: torch.Tensor,
+    sigma_prior: float,
+    sigma_lik: float,
+) -> torch.Tensor:
+    """
+    Torch helper mirroring log_posterior_unnorm_numpy for use during training.
+    """
+    prior_term = -0.5 * torch.sum((par_batch / sigma_prior) ** 2, dim=1)
+    resid = (obs_pred - y_obs_tensor) / sigma_lik
+    lik_term = -0.5 * torch.sum(resid ** 2, dim=1)
+    return prior_term + lik_term
+
+
+def _ensure_grad_contiguous(model: nn.Module) -> None:
+    """Make any existing gradients contiguous to satisfy optimizers like LBFGS."""
+    for param in model.parameters():
+        if param.grad is not None and not param.grad.is_contiguous():
+            param.grad = param.grad.contiguous()
 
 
 def standardize_features(
@@ -158,124 +216,228 @@ def train_mlp(
     max_lbfgs_iter: int = 50,
     loss_name: str = "l1",
     train_loops: int = 1,
+    batch_size: int | None = None,
+    loss_domain: str = "obs",
+    par_train_raw: np.ndarray | None = None,
+    logpi_targets: np.ndarray | None = None,
+    y_obs: np.ndarray | None = None,
+    sigma_prior: float = 1.0,
+    sigma_lik: float = 1.0,
+    batch_growth: float | None = None,
+    verbose: int = 1,
+    loop_improvement_pct: float = 1.0,
+    fine_tune: bool = False,
+    fine_tune_adam_lr: float = 1e-4,
+    fine_tune_adam_epochs: int = 200,
+    fine_tune_lbfgs_steps: int = 20,
+    fine_tune_loops: int = 2,
 ) -> float:
-    """
-    Train MLP with Adam followed by LBFGS until plateau or max iterations.
-    Optionally repeat the Adam+LBFGS pair multiple times (train_loops).
-
-    Parameters
-    ----------
-    model : nn.Module
-        MLP model to train.
-    X_train : np.ndarray
-        Training inputs of shape (N, d_in) (already standardized).
-    y_train : np.ndarray
-        Training targets of shape (N, d_out).
-    device : torch.device
-        Device on which to run the training.
-    max_adam_epochs : int
-        Maximum number of Adam epochs.
-    adam_lr : float
-        Learning rate for Adam optimizer.
-    adam_patience : int
-        Number of epochs/steps with small improvement before stopping.
-    tol : float
-        Relative improvement tolerance for plateau detection.
-    max_lbfgs_iter : int
-        Maximum number of LBFGS iterations.
-    loss_name : str
-        Either 'l1' or 'mse' to choose the training loss.
-    train_loops : int
-        Number of outer loops repeating the Adam + LBFGS sequence.
-
-    Returns
-    -------
-    final_loss : float
-        Final training loss after both optimizers.
-    """
+    """Train the MLP using Adam + LBFGS with optional log-posterior loss."""
     model.to(device)
     model.train()
 
+    def log_msg(msg: str, level: int = 2) -> None:
+        if verbose >= level:
+            print(msg)
+
+    def log_loop_summary(loop_idx: int, loss_value: float, next_lr: float, reason: str) -> None:
+        if verbose >= 1:
+            print(
+                f"[train][loop {loop_idx + 1}/{train_loops}] loss={loss_value:.6e} "
+                f"next_lr={next_lr:.3e} stop={reason}"
+            )
+
+    if fine_tune:
+        max_adam_epochs = fine_tune_adam_epochs
+        adam_lr = fine_tune_adam_lr
+        max_lbfgs_iter = fine_tune_lbfgs_steps
+        train_loops = fine_tune_loops
+
     X_tensor = torch.from_numpy(X_train.astype(np.float32)).to(device)
     y_tensor = torch.from_numpy(y_train.astype(np.float32)).to(device)
+    par_tensor_raw = (
+        torch.from_numpy(par_train_raw.astype(np.float32)).to(device)
+        if par_train_raw is not None
+        else None
+    )
+    logpi_tensor = (
+        torch.from_numpy(logpi_targets.astype(np.float32)).to(device)
+        if logpi_targets is not None
+        else None
+    )
+    y_obs_tensor = (
+        torch.from_numpy(y_obs.astype(np.float32)).to(device)
+        if y_obs is not None
+        else None
+    )
+
+    n_samples = X_tensor.shape[0]
+    if n_samples == 0:
+        raise ValueError("Training set is empty.")
+
+    if batch_size is None or batch_size <= 0 or batch_size > n_samples:
+        effective_batch = n_samples
+    else:
+        effective_batch = batch_size
 
     loss_name_lower = loss_name.lower()
-    if loss_name_lower == "l1":
-        criterion = nn.L1Loss()
-    elif loss_name_lower == "mse":
-        criterion = nn.MSELoss()
-    else:
-        raise ValueError(f"Unsupported loss_name '{loss_name}'. Expected 'l1' or 'mse'.")
+    if loss_name_lower not in {"l1", "mse", "mixed"}:
+        raise ValueError(
+            f"Unsupported loss_name '{loss_name}'. Expected 'l1', 'mse', or 'mixed'."
+        )
+
+    def make_criterion(name: str) -> nn.Module:
+        return nn.L1Loss() if name == "l1" else nn.MSELoss()
+
+    loss_domain_lower = loss_domain.lower()
+    if loss_domain_lower not in {"obs", "logpi"}:
+        raise ValueError("loss_domain must be 'obs' or 'logpi'.")
+    use_logpi_loss = loss_domain_lower == "logpi"
+    if use_logpi_loss and (
+        par_tensor_raw is None or logpi_tensor is None or y_obs_tensor is None
+    ):
+        raise ValueError(
+            "logpi loss requires par_train_raw, logpi_targets, and y_obs inputs."
+        )
 
     if train_loops <= 0:
         raise ValueError("train_loops must be a positive integer.")
 
     best_loss = float("inf")
+    current_adam_lr = adam_lr
+    indices = torch.arange(n_samples, dtype=torch.long)
+    growth_factor = (
+        None if batch_growth is None or batch_growth <= 1.0 else float(batch_growth)
+    )
+    prev_loop_loss: float | None = None
 
     for loop_idx in range(train_loops):
+        loop_stop_reason = "completed"
+        stop_after_summary = False
         loop_str = f"[train][loop {loop_idx + 1}/{train_loops}]"
-
-        # Phase 1: Adam
-        optimizer_adam = torch.optim.Adam(model.parameters(), lr=adam_lr)
+        if loss_name_lower == "mixed":
+            current_loss_name = "mse" if loop_idx % 2 == 0 else "l1"
+        else:
+            current_loss_name = loss_name_lower
+        criterion = make_criterion(current_loss_name)
+        optimizer_adam = torch.optim.Adam(model.parameters(), lr=current_adam_lr)
         no_improve = 0
-        print(
-            f"{loop_str} Starting Adam: max_epochs={max_adam_epochs}, loss={loss_name_lower.upper()}, "
-            f"lr={optimizer_adam.param_groups[0]['lr']:.3e}"
+        if growth_factor is not None:
+            batch_size_loop = int(round(effective_batch * (growth_factor ** loop_idx)))
+            batch_size_loop = max(1, min(batch_size_loop, n_samples))
+        else:
+            batch_size_loop = effective_batch
+        log_msg(
+            f"{loop_str} Starting Adam: epochs={max_adam_epochs}, loss={current_loss_name.upper()}, "
+            f"lr={optimizer_adam.param_groups[0]['lr']:.3e}, batch={batch_size_loop}, domain={loss_domain_lower}",
+            level=2,
         )
         for epoch in range(1, max_adam_epochs + 1):
-            optimizer_adam.zero_grad()
-            preds = model(X_tensor)
-            loss = criterion(preds, y_tensor)
-            loss.backward()
-            optimizer_adam.step()
+            loader = DataLoader(indices, batch_size=batch_size_loop, shuffle=True)
+            for batch_idx in loader:
+                batch_idx = batch_idx.to(device)
+                batch_X = X_tensor[batch_idx]
+                optimizer_adam.zero_grad()
+                preds = model(batch_X)
 
-            loss_val = loss.item()
-            if epoch == 1 or epoch % 10 == 0:
+                if use_logpi_loss:
+                    batch_par = par_tensor_raw[batch_idx]
+                    batch_logpi = logpi_tensor[batch_idx]
+                    logpi_pred = _logpi_from_preds(
+                        batch_par, preds, y_obs_tensor, sigma_prior, sigma_lik
+                    )
+                    loss = criterion(logpi_pred, batch_logpi)
+                else:
+                    batch_y = y_tensor[batch_idx]
+                    loss = criterion(preds, batch_y)
+
+                loss.backward()
+                _ensure_grad_contiguous(model)
+                optimizer_adam.step()
+
+            with torch.no_grad():
+                full_preds = model(X_tensor)
+                if use_logpi_loss:
+                    logpi_pred_full = _logpi_from_preds(
+                        par_tensor_raw, full_preds, y_obs_tensor, sigma_prior, sigma_lik
+                    )
+                    full_loss = criterion(logpi_pred_full, logpi_tensor)
+                else:
+                    full_loss = criterion(full_preds, y_tensor)
+                loss_val = float(full_loss.item())
+
+            if verbose >= 2 and (epoch == 1 or epoch % 10 == 0):
                 current_lr = optimizer_adam.param_groups[0]["lr"]
-                print(
-                    f"{loop_str}[Adam] epoch {epoch:4d} | loss({loss_name_lower}) = {loss_val:.6e} | lr = {current_lr:.3e}"
+                log_msg(
+                    f"{loop_str}[Adam] epoch {
+                        epoch:4d} | loss({current_loss_name}) = {
+                        loss_val:.6e} | lr = {
+                        current_lr:.3e}",
+                    level=2,
                 )
 
-            # Plateau detection (relative improvement)
             if best_loss == float("inf") or loss_val < best_loss - tol * (abs(best_loss) + 1e-12):
                 best_loss = loss_val
                 no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= adam_patience:
-                    print(f"{loop_str}[Adam] plateau detected at epoch {epoch}, stopping early.")
+                    loop_stop_reason = "adam_plateau"
+                    current_adam_lr *= 0.25
+                    log_msg(
+                        f"{loop_str}[Adam] plateau at epoch {epoch}, reducing LR to {
+                            current_adam_lr:.3e} and stopping early.",
+                        level=2,
+                    )
+                    if current_adam_lr < 1e-6:
+                        log_msg(
+                            f"LR {current_adam_lr:.3e} below 1e-6 threshold; terminating training early.",
+                            level=2,
+                        )
+                        summary_loss = best_loss if best_loss != float("inf") else loss_val
+                        log_loop_summary(loop_idx, summary_loss, current_adam_lr, "adam_lr_min")
+                        return best_loss if best_loss != float("inf") else loss_val
                     break
 
-        # Phase 2: LBFGS (full-batch)
         optimizer_lbfgs = torch.optim.LBFGS(
             model.parameters(),
             lr=1.0,
-            max_iter=1,  # we'll loop manually
+            max_iter=1,
             history_size=100,
             line_search_fn="strong_wolfe",
         )
-
-        print(
-            f"{loop_str} Starting LBFGS: max_iter={max_lbfgs_iter}, loss={loss_name_lower.upper()}, "
-            f"lr={optimizer_lbfgs.param_groups[0]['lr']:.3e}"
+        log_msg(
+            f"{loop_str} Starting LBFGS: max_iter={max_lbfgs_iter}, loss={current_loss_name.upper()}, "
+            f"lr={optimizer_lbfgs.param_groups[0]['lr']:.3e}",
+            level=2,
         )
-        # reset plateau counter for LBFGS phase
         no_improve = 0
         for it in range(1, max_lbfgs_iter + 1):
 
             def closure():
                 optimizer_lbfgs.zero_grad()
                 preds = model(X_tensor)
-                loss = criterion(preds, y_tensor)
-                loss.backward()
-                return loss
+                if use_logpi_loss:
+                    logpi_pred = _logpi_from_preds(
+                        par_tensor_raw, preds, y_obs_tensor, sigma_prior, sigma_lik
+                    )
+                    loss_closure = criterion(logpi_pred, logpi_tensor)
+                else:
+                    loss_closure = criterion(preds, y_tensor)
+                loss_closure.backward()
+                _ensure_grad_contiguous(model)
+                return loss_closure
 
             loss = optimizer_lbfgs.step(closure)
             loss_val = float(loss.item())
-            if it == 1 or it % 5 == 0:
+            if verbose >= 2 and (it == 1 or it % 5 == 0):
                 current_lr = optimizer_lbfgs.param_groups[0]["lr"]
-                print(
-                    f"{loop_str}[LBFGS] iter {it:3d} | loss({loss_name_lower}) = {loss_val:.6e} | lr = {current_lr:.3e}"
+                log_msg(
+                    f"{loop_str}[LBFGS] iter {
+                        it:3d} | loss({current_loss_name}) = {
+                        loss_val:.6e} | lr = {
+                        current_lr:.3e}",
+                    level=2,
                 )
 
             if loss_val < best_loss - tol * (abs(best_loss) + 1e-12):
@@ -284,11 +446,33 @@ def train_mlp(
             else:
                 no_improve += 1
                 if no_improve >= adam_patience:
-                    print(f"{loop_str}[LBFGS] plateau detected at iter {it}, stopping early.")
+                    loop_stop_reason = "lbfgs_plateau"
+                    log_msg(f"{loop_str}[LBFGS] plateau detected at iter {it}, stopping early.", level=2)
                     break
 
+        loop_loss = best_loss if best_loss != float("inf") else loss_val
+        if prev_loop_loss is None:
+            prev_loop_loss = loop_loss
+        else:
+            required_improvement = abs(prev_loop_loss) * (loop_improvement_pct / 100.0)
+            actual_improvement = prev_loop_loss - loop_loss
+            if actual_improvement < required_improvement:
+                loop_stop_reason = "improvement_stop"
+                stop_after_summary = True
+            else:
+                prev_loop_loss = loop_loss
+
+        log_loop_summary(loop_idx, loop_loss, current_adam_lr, loop_stop_reason)
+
+        if stop_after_summary:
+            break
+
     final_loss = best_loss
-    print(f"[train] Finished training with final train loss({loss_name_lower}) = {final_loss:.6e}")
+    summary_label = "MIXED" if loss_name_lower == "mixed" else loss_name_lower.upper()
+    log_msg(
+        f"[train] Finished training with final train loss({summary_label}) = {final_loss:.6e}",
+        level=2,
+    )
     return final_loss
 
 
@@ -391,6 +575,43 @@ def evaluate_da_metrics(
     return metrics
 
 
+def compute_logpi_l1_error(
+    model: nn.Module,
+    par: np.ndarray,
+    logpi_true: np.ndarray,
+    chain: np.ndarray,
+    props: np.ndarray,
+    val_start: int,
+    val_len: int,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_obs: np.ndarray,
+    sigma_prior: float,
+    sigma_lik: float,
+    device: torch.device,
+) -> float:
+    """
+    Mean absolute error between true and surrogate log posterior on unique validation samples.
+    """
+    model.eval()
+    idx_curr = chain[val_start: val_start + val_len]
+    idx_prop = props[val_start: val_start + val_len]
+    unique_idx = unique_preserve_order(np.concatenate([idx_curr, idx_prop]))
+
+    par_unique = par[unique_idx]
+    X_unique = apply_standardization(par_unique, x_mean, x_std)
+
+    with torch.no_grad():
+        X_t = torch.from_numpy(X_unique.astype(np.float32)).to(device)
+        obs_pred = model(X_t).cpu().numpy()
+
+    logpi_pred = log_posterior_unnorm_numpy(
+        par_unique, obs_pred, y_obs, sigma_prior, sigma_lik
+    )
+    logpi_true_subset = logpi_true[unique_idx]
+    return float(np.mean(np.abs(logpi_true_subset - logpi_pred)))
+
+
 def load_data(path: str, sigma_prior: float, sigma_lik: float):
     """
     Load data from HDF5 file.
@@ -445,8 +666,28 @@ def main():
     )
     parser.add_argument("--sigma-prior", type=float, default=1.0, help="Prior std (for log posterior).")
     parser.add_argument("--sigma-lik", type=float, default=0.3, help="Likelihood std (for log posterior).")
-    parser.add_argument("--max-train-size", type=int, default=19500, help="Max training size (<= len(chain)-val_size).")
-    parser.add_argument("--train-step", type=int, default=500, help="Step for increasing train size (and default validation window length).")
+    parser.add_argument(
+        "--train-cutoff",
+        type=int,
+        default=19500,
+        help="Maximum number of chain steps allowed for training (bounded by total length).",
+    )
+    parser.add_argument(
+        "--train-step",
+        type=int,
+        default=500,
+        help="Step for increasing train size (and default validation window length).")
+    parser.add_argument(
+        "--progress-train-step",
+        action="store_true",
+        help="When set, increase train size multiplicatively using --train-step-multiplier.",
+    )
+    parser.add_argument(
+        "--train-step-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier used for progressive train sizes when --progress-train-step is enabled.",
+    )
     parser.add_argument(
         "--val-size",
         type=int,
@@ -467,9 +708,40 @@ def main():
     )
     parser.add_argument(
         "--train-loss",
-        choices=["l1", "mse"],
+        choices=["l1", "mse", "mixed"],
         default="l1",
-        help="Training loss to optimize (default: l1).",
+        help="Training loss to optimize (default: l1). Use 'mixed' to alternate MSE/L1 per loop.",
+    )
+    parser.add_argument(
+        "--loss-domain",
+        choices=["obs", "logpi"],
+        default="obs",
+        help="Optimize loss in observation space ('obs') or log posterior ('logpi').",
+    )
+    parser.add_argument(
+        "--activation",
+        choices=["relu", "tanh"],
+        default="tanh",
+        help="Hidden-layer activation (default: tanh).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Mini-batch size for Adam (default: full batch).",
+    )
+    parser.add_argument(
+        "--batch-growth",
+        type=float,
+        default=None,
+        help="If >1, multiply Adam batch size by this factor on each train loop.",
+    )
+    parser.add_argument(
+        "--train-window",
+        type=int,
+        default=None,
+        help="Optional limit on how many initial chain steps are ever used for training; "
+             "validation always starts immediately after this window when provided.",
     )
     parser.add_argument(
         "--train-loops",
@@ -477,10 +749,28 @@ def main():
         default=1,
         help="Number of outer training loops (Adam + LBFGS repetitions).",
     )
+    parser.add_argument(
+        "--retrain",
+        action="store_true",
+        help="Reinitialize the MLP from scratch for every train size increment.",
+    )
+    parser.add_argument(
+        "--reinit-before-train",
+        action="store_true",
+        help="Reinitialize model weights before each training size update (after potential architecture growth).",
+    )
+    parser.add_argument(
+        "--loop-improvement-pct",
+        type=float,
+        default=1.0,
+        help="Minimum percentage improvement required between training loops; stops early if not met.",
+    )
     args = parser.parse_args()
 
     # Determine validation size (defaults to train step when not provided)
     val_size = args.train_step if args.val_size is None else args.val_size
+    if val_size <= 0:
+        raise ValueError("val_size must be positive.")
 
     # Reproducibility
     np.random.seed(args.seed)
@@ -496,19 +786,61 @@ def main():
     )
 
     n_chain = chain.shape[0]
-    max_train_allowed = n_chain - val_size
+    if args.train_window is not None:
+        train_window = args.train_window
+        if train_window <= 0:
+            raise ValueError("train_window must be positive.")
+        if train_window + val_size > n_chain:
+            raise ValueError("train_window + val_size exceeds chain length.")
+        val_start = train_window
+        max_train_allowed = train_window
+    else:
+        if val_size >= n_chain:
+            raise ValueError("Validation size must be smaller than the chain length.")
+        val_start = n_chain - val_size
+        max_train_allowed = val_start
     if max_train_allowed <= 0:
-        raise ValueError("Validation size is too large compared to chain length.")
-    max_train = min(args.max_train_size, max_train_allowed)
+        raise ValueError("Not enough samples remain for training once validation is reserved.")
+    max_train = min(args.train_cutoff, max_train_allowed)
 
-    # train sizes: 500, 1000, ..., up to max_train
-    train_sizes = list(range(args.train_step, max_train + 1, args.train_step))
+    if args.train_step <= 0:
+        raise ValueError("train_step must be positive.")
+
+    if args.progress_train_step:
+        if args.train_step_multiplier <= 1.0:
+            raise ValueError("train-step-multiplier must be > 1.0 when progressive stepping is enabled.")
+        train_sizes = []
+        current = args.train_step
+        while current <= max_train:
+            train_sizes.append(int(current))
+            current = max(
+                int(math.ceil(current * args.train_step_multiplier)),
+                train_sizes[-1] + 1,
+            )
+    else:
+        train_sizes = list(range(args.train_step, max_train + 1, args.train_step))
     print(f"[setup] Train sizes to test: {train_sizes}")
+    if args.train_window is not None:
+        print(
+            f"[setup] Validation window starts after train window {val_start} "
+            f"with length {val_size}."
+        )
+    else:
+        print(f"[setup] Validation window fixed to final {val_size} steps (start index {val_start}).")
 
     input_dim = par.shape[1]
     output_dim = obs.shape[1]
 
-    model = MLP(input_dim=input_dim, hidden_sizes=args.hidden_sizes, output_dim=output_dim)
+    def init_model() -> nn.Module:
+        m = MLP(
+            input_dim=input_dim,
+            hidden_sizes=args.hidden_sizes,
+            output_dim=output_dim,
+            activation=args.activation,
+        )
+        return m
+
+    model = init_model()
     print(model)
     records = []
     depth = len(args.hidden_sizes)
@@ -527,9 +859,11 @@ def main():
             "[run] Using %d unique samples (chain + proposals) from first %d chain steps."
             % (train_idx.size, n_train)
         )
+        print(f"[train] Training samples range: [0, {n_train}) with {train_idx.size} unique inputs.")
 
         X_train_raw = par[train_idx]
         y_train = obs[train_idx]
+        logpi_train = logpi_true[train_idx]
 
         # Optionally standardize inputs on training set
         if args.standardize:
@@ -539,7 +873,12 @@ def main():
             x_mean = np.zeros(X_train_raw.shape[1], dtype=X_train_raw.dtype)
             x_std = np.ones(X_train_raw.shape[1], dtype=X_train_raw.dtype)
 
-        # Continue training the existing model instead of restarting each time
+        # Reinitialize model if requested, otherwise continue training the existing one
+        if args.retrain:
+            model = init_model()
+        elif args.reinit_before_train:
+            model.reinitialize()
+
         final_train_loss = train_mlp(
             model,
             X_train_std,
@@ -552,10 +891,18 @@ def main():
             max_lbfgs_iter=args.lbfgs_steps,
             loss_name=args.train_loss,
             train_loops=args.train_loops,
+            batch_size=args.batch_size,
+            loss_domain=args.loss_domain,
+            par_train_raw=X_train_raw,
+            logpi_targets=logpi_train,
+            y_obs=y_obs,
+            sigma_prior=args.sigma_prior,
+            sigma_lik=args.sigma_lik,
+            batch_growth=args.batch_growth,
+            loop_improvement_pct=args.loop_improvement_pct,
         )
 
-        # Evaluate on the next val_size samples
-        val_start = n_train
+        # Evaluate on the held-out tail of the chain
         metrics = evaluate_da_metrics(
             model,
             par,
@@ -572,6 +919,21 @@ def main():
             sigma_lik=args.sigma_lik,
             device=device,
         )
+        logpi_l1_error = compute_logpi_l1_error(
+            model,
+            par,
+            logpi_true,
+            chain,
+            props,
+            val_start=val_start,
+            val_len=val_size,
+            x_mean=x_mean,
+            x_std=x_std,
+            y_obs=y_obs,
+            sigma_prior=args.sigma_prior,
+            sigma_lik=args.sigma_lik,
+            device=device,
+        )
 
         record = {
             "train_size": n_train,
@@ -581,6 +943,7 @@ def main():
             "train_step": args.train_step,
             "train_loss": args.train_loss,
             "final_train_loss": final_train_loss,
+            "val_logpi_l1_error": logpi_l1_error,
         }
         record.update(metrics)
         records.append(record)
